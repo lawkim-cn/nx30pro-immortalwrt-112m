@@ -5,8 +5,8 @@
 #    1. 用 scripts/enable_112m.py 改成 112M 大分区（配合 Yuzhii U-Boot 的 112m 布局）
 #    2. 默认主题改为 luci-theme-argon（使用 ImmortalWrt luci 源自带版本，兼容性最好）
 #    3. 集成 kenzok8/openwrt-daede（luci-app-daede + daed，走内核 BTF）
-#       注意：daed 的 go.mod 要求 Go >= 1.26.10，官方 25.12 源自带的 Go 太旧，
-#       工作流会用 kenzok8/golang 的 1.26 分支替换官方 golang 包。
+#       注意：daed 的 go.mod 要求 Go >= 1.27.0，官方 25.12 源自带的 Go 太旧，
+#       工作流会用 kenzok8/golang 的 1.27 分支（1.27.3）替换官方 golang 包。
 #    4. 空间允许时再集成官方 luci-app-passwall（仅保留 Xray 核心，尽量省空间）
 #
 #  空间策略：
@@ -109,21 +109,23 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 升级 Golang 到 1.26.10（daed 要求）
+      - name: 升级 Golang 到 1.27.3（daed 要求）
         run: |
           set -euo pipefail
           cd "$OPENWRT_DIR"
 
-          # daed 的 go.mod 明确要求 go >= 1.26.10，而 25.12 官方源里的
-          # golang1.26 只有 1.26.8；golang-package.mk 又固定了 GOTOOLCHAIN=local，
-          # 不会自动下载新工具链，所以会报 "go.mod requires go >= 1.26.10"。
-          # 用 kenzok8/golang 的 1.26 分支（当前正好是 1.26.10）整体替换官方 golang。
+          # daed 的 wing/go.mod 和 outbound/go.mod 都要求 go >= 1.27.0，而 25.12
+          # 官方源里的 golang1.26 只有 1.26.8；golang-package.mk 又固定了
+          # GOTOOLCHAIN=local，不会自动下载新工具链，所以会报
+          # "go.mod requires go >= 1.27.0"。
+          # 用 kenzok8/golang 的 1.27 分支（当前是 1.27.3）整体替换官方 golang。
           # 该仓库本身就是 feed 结构：golang/Makefile + 根目录的 golang-*.mk，
           # 与 feeds/packages/lang/golang 的布局一致，直接 clone 即可。
           rm -rf feeds/packages/lang/golang \
                  package/feeds/packages/golang1.26 \
+                 package/feeds/packages/golang1.27 \
                  package/feeds/packages/golang-bootstrap
-          git clone --depth 1 -b 1.26 https://github.com/kenzok8/golang.git \
+          git clone --depth 1 -b 1.27 https://github.com/kenzok8/golang.git \
                 feeds/packages/lang/golang
           # 重新指向新的包目录（kenzok8 仓库里包在 golang/ 子目录）
           ln -sfn ../../../feeds/packages/lang/golang/golang \

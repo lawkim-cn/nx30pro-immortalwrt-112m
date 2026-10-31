@@ -5,6 +5,8 @@
 #    1. 用 scripts/enable_112m.py 改成 112M 大分区（配合 Yuzhii U-Boot 的 112m 布局）
 #    2. 默认主题改为 luci-theme-argon（使用 ImmortalWrt luci 源自带版本，兼容性最好）
 #    3. 集成 kenzok8/openwrt-daede（luci-app-daede + daed，走内核 BTF）
+#       注意：daed 的 go.mod 要求 Go >= 1.26.10，官方 25.12 源自带的 Go 太旧，
+#       工作流会用 kenzok8/golang 的 1.26 分支替换官方 golang 包。
 #    4. 空间允许时再集成官方 luci-app-passwall（仅保留 Xray 核心，尽量省空间）
 #
 #  空间策略：
@@ -13,6 +15,7 @@
 #    基础固件，保证每次至少有一个可刷的固件。
 # =============================================================================
 name: build-immortalwrt-112m
+
 on:
   workflow_dispatch:
     inputs:
@@ -28,23 +31,29 @@ on:
         description: "额外软件包（空格分隔，可留空）"
         required: false
         default: ""
+
 permissions:
   contents: read
+
 concurrency:
   group: build-immortalwrt-112m-${{ github.ref }}
   cancel-in-progress: false
+
 env:
   OPENWRT_DIR: openwrt
   # enable_112m.py 把该设备 IMAGE_SIZE 改成 114688k（112M）
   IMAGE_LIMIT_KB: "114688"
+
 jobs:
   build:
     name: 编译 NX30PRO 112M 固件
     runs-on: ubuntu-latest
     timeout-minutes: 350
+
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
+
       - name: 释放磁盘空间
         run: |
           set -euo pipefail
@@ -59,6 +68,7 @@ jobs:
             /usr/local/lib/node_modules
           sudo apt-get clean
           df -h /
+
       - name: 安装编译依赖
         run: |
           set -euo pipefail
@@ -70,6 +80,7 @@ jobs:
             libelf-dev libdw-dev dwarves libcap-dev pkg-config autoconf automake \
             libtool-bin cmake
           df -h /
+
       - name: 拉取 ImmortalWrt 源码
         env:
           TAG: ${{ inputs.tag }}
@@ -78,22 +89,52 @@ jobs:
           git clone --depth 1 --branch "$TAG" \
             https://github.com/immortalwrt/immortalwrt.git "$OPENWRT_DIR"
           git -C "$OPENWRT_DIR" log -1 --format='commit %H%nsubject %s%ndate %ad'
+
       - name: 改为 112M 大分区
         run: |
           set -euo pipefail
           python3 scripts/enable_112m.py "$OPENWRT_DIR"
           git -C "$OPENWRT_DIR" diff --stat
           git -C "$OPENWRT_DIR" diff > 112m-changes.diff
+
       - name: 更新并安装 feeds
         run: |
           set -euo pipefail
           cd "$OPENWRT_DIR"
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+
+      - name: 升级 Golang 到 1.26.10（daed 要求）
+        run: |
+          set -euo pipefail
+          cd "$OPENWRT_DIR"
+
+          # daed 的 go.mod 明确要求 go >= 1.26.10，而 25.12 官方源里的
+          # golang1.26 只有 1.26.8；golang-package.mk 又固定了 GOTOOLCHAIN=local，
+          # 不会自动下载新工具链，所以会报 "go.mod requires go >= 1.26.10"。
+          # 用 kenzok8/golang 的 1.26 分支（当前正好是 1.26.10）整体替换官方 golang。
+          # 该仓库本身就是 feed 结构：golang/Makefile + 根目录的 golang-*.mk，
+          # 与 feeds/packages/lang/golang 的布局一致，直接 clone 即可。
+          rm -rf feeds/packages/lang/golang \
+                 package/feeds/packages/golang1.26 \
+                 package/feeds/packages/golang-bootstrap
+          git clone --depth 1 -b 1.26 https://github.com/kenzok8/golang.git \
+                feeds/packages/lang/golang
+          # 重新指向新的包目录（kenzok8 仓库里包在 golang/ 子目录）
+          ln -sfn ../../../feeds/packages/lang/golang/golang \
+                package/feeds/packages/golang
+
+          echo "=== 使用的 Go 版本 ==="
+          grep -E '^(GO_VERSION_MAJOR_MINOR|GO_VERSION_PATCH)' \
+                feeds/packages/lang/golang/golang/Makefile
+          test -f feeds/packages/lang/golang/golang-package.mk
+          test -f package/feeds/packages/golang/Makefile
+
       - name: 移除冲突包并加入 DAED / Passwall 源码
         run: |
           set -euo pipefail
           cd "$OPENWRT_DIR"
+
           # Passwall 上游 README 要求：先删掉 openwrt 源里同名的核心包，
           # 避免 package/feeds 与 package/ 下出现同名包导致版本/依赖混乱。
           for p in xray-core v2ray-geodata sing-box chinadns-ng dns2socks hysteria \
@@ -102,6 +143,7 @@ jobs:
             rm -rf "feeds/packages/net/$p" "package/feeds/packages/$p"
           done
           rm -rf feeds/luci/applications/luci-app-passwall package/feeds/luci/luci-app-passwall
+
           # ImmortalWrt 自带 dae / daed / luci-app-daed，与 kenzok8/openwrt-daede
           # 里的包同名，必须先移除，否则 Kconfig 会出现重复包。
           for p in dae daed; do
@@ -109,30 +151,37 @@ jobs:
           done
           rm -rf feeds/luci/applications/luci-app-daed package/feeds/luci/luci-app-daed
           rm -rf feeds/luci/applications/luci-app-dae  package/feeds/luci/luci-app-dae
+
           # 主题：luci-theme-argon 已经包含在 ImmortalWrt 的 luci feed 里，
           # 直接选用即可（不额外 clone，避免与 feed 内同名包冲突）。
+
           # DAED：仓库内含 dae / daed / luci-app-daede / vmlinux-btf
           git clone --depth 1 https://github.com/kenzok8/openwrt-daede.git \
             package/openwrt-daede
+
           # Passwall：官方源（Openwrt-Passwall 组织），按上游 README 直接放进 package/
           git clone --depth 1 https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git \
             package/passwall-packages
           git clone --depth 1 https://github.com/Openwrt-Passwall/openwrt-passwall.git \
             package/passwall-luci
+
           # 25.12 官方源已经没有 lyaml 这个包，去掉这条依赖以免 Kconfig 告警。
           # 这里只做“尽量清理”，即使上游改了写法也不会中断编译。
           sed -i 's/ +lyaml//' package/passwall-luci/luci-app-passwall/Makefile || true
           if grep -q 'lyaml' package/passwall-luci/luci-app-passwall/Makefile; then
             echo "::warning::luci-app-passwall 仍依赖 lyaml（官方源已移除该包），构建时将忽略此依赖"
           fi
+
           # 确认关键包目录都在
           test -f package/openwrt-daede/luci-app-daede/Makefile
           test -f package/passwall-packages/v2ray-geodata/Makefile
           test -f package/passwall-luci/luci-app-passwall/Makefile
+
       - name: 设置默认主题为 Argon
         run: |
           set -euo pipefail
           cd "$OPENWRT_DIR"
+
           # LuCI 的集合包（luci-light 等）里默认依赖 luci-theme-bootstrap，
           # 全部替换成 luci-theme-argon，这样镜像里不会再装 bootstrap。
           mapfile -t collections < <(grep -rl 'luci-theme-bootstrap' feeds/luci/collections || true)
@@ -142,6 +191,7 @@ jobs:
           else
             echo "::warning::feeds/luci/collections 中没有 luci-theme-bootstrap，跳过集合依赖替换"
           fi
+
           # 首次启动再兜底写一次 mediaurlbase（sysupgrade 保留配置时不会重复执行）
           mkdir -p files/etc/uci-defaults
           cat > files/etc/uci-defaults/99-default-argon <<'EOF'
@@ -152,12 +202,14 @@ jobs:
           exit 0
           EOF
           chmod +x files/etc/uci-defaults/99-default-argon
+
       - name: 生成基础配置（Argon + DAED）
         env:
           EXTRA_PACKAGES: ${{ inputs.extra_packages }}
         run: |
           set -euo pipefail
           cd "$OPENWRT_DIR"
+
           cat > .config <<'EOF'
           CONFIG_TARGET_mediatek=y
           CONFIG_TARGET_mediatek_filogic=y
@@ -176,14 +228,18 @@ jobs:
           CONFIG_KERNEL_DEBUG_INFO_REDUCED=n
           CONFIG_KERNEL_DEBUG_INFO_BTF=y
           EOF
+
           for p in $EXTRA_PACKAGES; do
             echo "CONFIG_PACKAGE_${p}=y" >> .config
           done
+
           make defconfig
+
           echo "=== 目标设备 ==="
           grep -E '^CONFIG_TARGET_(mediatek|.*DEVICE)' .config || true
           echo "=== 关键软件包 ==="
           grep -E '^CONFIG_PACKAGE_(luci|luci-theme-argon|luci-app-daede|daed)=' .config || true
+
           grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_h3c_magic-nx30-pro=y' .config || {
             echo "ERROR: 没有选中 h3c_magic-nx30-pro"; exit 1; }
           grep -q '^CONFIG_PACKAGE_luci-theme-argon=y' .config || {
@@ -192,27 +248,60 @@ jobs:
             echo "ERROR: luci-app-daede 没有被选中"; exit 1; }
           grep -q '^CONFIG_PACKAGE_daed=y' .config || {
             echo "ERROR: daed 没有被选中（检查内核 BTF / XDP_SOCKETS 配置）"; exit 1; }
+
           # 记录 DAED 使用的是内核 BTF 还是 vmlinux-btf
           grep -E '^CONFIG_DAED_USE_' .config || true
           grep -E '^CONFIG_KERNEL_(DEBUG_INFO|DEBUG_INFO_BTF|XDP_SOCKETS)' .config || true
           if ! grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config; then
             echo "::warning::内核 BTF 没有开启，DAED 会退回 vmlinux-btf（可能在运行时匹配不上内核）"
           fi
+
       - name: 预下载源码包
         continue-on-error: true
         run: |
           cd "$OPENWRT_DIR"
           make -j"$(nproc)" download
+
       - name: 编译基础固件（Argon + DAED）
         run: |
           set -euo pipefail
           cd "$OPENWRT_DIR"
           make -j"$(nproc)" 2>&1 | tee ../build-base.log
           echo "=== 基础固件编译完成 ==="
+
+      - name: 失败诊断（提取真实错误）
+        if: failure()
+        run: |
+          set -uo pipefail
+
+          : > build-error.txt
+          for log in build-base.log build-passwall.log; do
+            [ -f "$log" ] || continue
+            {
+              echo "===== $log ====="
+              echo "--- 关键字（最后 80 条）---"
+              grep -n -i -E "go: |error:|fatal|failed|Error [0-9]" "$log" | tail -n 80 || true
+              echo "--- 末尾 120 行 ---"
+              tail -n 120 "$log"
+              echo
+            } >> build-error.txt
+          done
+
+          cat build-error.txt
+          {
+            echo ""
+            echo "### 构建失败详情"
+            echo '```'
+            tail -n 200 build-error.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
       - name: 收集基础固件
         run: |
           set -euo pipefail
           cd "$OPENWRT_DIR"
+
           mkdir -p ../out/base
           shopt -s nullglob
           files=(bin/targets/mediatek/filogic/*.itb \
@@ -226,6 +315,7 @@ jobs:
           cp -v ../112m-changes.diff ../out/base/ 2>/dev/null || true
           cp -v bin/targets/mediatek/filogic/sha256sums ../out/base/ 2>/dev/null || true
           cp -v bin/targets/mediatek/filogic/profiles.json ../out/base/ 2>/dev/null || true
+
           img=$(ls ../out/base/*-squashfs-sysupgrade.itb 2>/dev/null | head -n1 || true)
           if [ -z "$img" ]; then
             echo "ERROR: 没有生成 *-squashfs-sysupgrade.itb"
@@ -235,15 +325,18 @@ jobs:
           echo "BASE_IMAGE=$img" >> "$GITHUB_ENV"
           echo "BASE_SIZE_KB=$size_kb" >> "$GITHUB_ENV"
           echo "基础固件：$img（${size_kb} KB / 上限 ${IMAGE_LIMIT_KB} KB）"
+
           if [ "$size_kb" -ge "$IMAGE_LIMIT_KB" ]; then
             echo "ERROR: 基础固件已经超过 112M 分区上限"
             exit 1
           fi
+
       - name: 追加 Passwall 配置
         if: ${{ inputs.with_passwall }}
         run: |
           set -euo pipefail
           cd "$OPENWRT_DIR"
+
           cat >> .config <<'EOF'
           # Passwall 只保留 Xray 核心，其余可选组件全部关掉以节省 112M 空间
           CONFIG_PACKAGE_dnsmasq=n
@@ -271,7 +364,9 @@ jobs:
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray=y
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray_Plugin=n
           EOF
+
           make defconfig
+
           # dnsmasq-full / ip-full 与默认的 dnsmasq / ip-tiny 冲突，
           # 反复几轮确保默认包被彻底关掉
           for _ in 1 2 3; do
@@ -289,8 +384,10 @@ jobs:
             fi
             make defconfig
           done
+
           echo "=== Passwall 相关配置 ==="
           grep -E '^CONFIG_PACKAGE_(luci-app-passwall|dnsmasq|ip-full|ip-tiny|xray)' .config || true
+
           if ! grep -q '^CONFIG_PACKAGE_luci-app-passwall=y' .config; then
             echo "PASSWALL_STATUS=skipped" >> "$GITHUB_ENV"
             echo "::warning::luci-app-passwall 没有被选中（依赖不满足），本次只发布基础固件"
@@ -301,21 +398,26 @@ jobs:
             echo "::warning::Passwall 的 Xray 核心没有选中，本次只发布基础固件"
             exit 0
           fi
+
           echo "PASSWALL_STATUS=pending" >> "$GITHUB_ENV"
+
       - name: 编译含 Passwall 的固件
         if: ${{ inputs.with_passwall && env.PASSWALL_STATUS == 'pending' }}
         run: |
           set -euo pipefail
           cd "$OPENWRT_DIR"
+
           set +e
           make -j"$(nproc)" 2>&1 | tee ../build-passwall.log
           rc=${PIPESTATUS[0]}
           set -e
+
           if [ "$rc" -ne 0 ]; then
             echo "PASSWALL_STATUS=failed" >> "$GITHUB_ENV"
             echo "::warning::加入 Passwall 后编译失败（多半是 112M 空间不足），本次只发布基础固件，详见 build-passwall.log"
             exit 0
           fi
+
           shopt -s nullglob
           files=(bin/targets/mediatek/filogic/*.itb)
           if [ "${#files[@]}" -eq 0 ]; then
@@ -323,6 +425,7 @@ jobs:
             echo "::warning::没有生成带 Passwall 的固件，本次只发布基础固件"
             exit 0
           fi
+
           mkdir -p ../out/passwall
           cp -v bin/targets/mediatek/filogic/*.itb \
                 bin/targets/mediatek/filogic/*.bin \
@@ -330,6 +433,7 @@ jobs:
           cp -v ../112m-changes.diff ../out/passwall/ 2>/dev/null || true
           cp -v bin/targets/mediatek/filogic/sha256sums ../out/passwall/ 2>/dev/null || true
           cp -v bin/targets/mediatek/filogic/profiles.json ../out/passwall/ 2>/dev/null || true
+
           img=$(ls ../out/passwall/*-squashfs-sysupgrade.itb 2>/dev/null | head -n1 || true)
           if [ -z "$img" ]; then
             echo "PASSWALL_STATUS=failed" >> "$GITHUB_ENV"
@@ -341,10 +445,12 @@ jobs:
           echo "PASSWALL_SIZE_KB=$size_kb" >> "$GITHUB_ENV"
           echo "PASSWALL_STATUS=ok" >> "$GITHUB_ENV"
           echo "含 Passwall 固件：$img（${size_kb} KB / 上限 ${IMAGE_LIMIT_KB} KB）"
+
           if [ "$size_kb" -ge "$IMAGE_LIMIT_KB" ]; then
             echo "PASSWALL_STATUS=failed" >> "$GITHUB_ENV"
             echo "::warning::带 Passwall 的固件超过上限，本次只发布基础固件"
           fi
+
       - name: 选择要发布的固件
         if: success()
         run: |
@@ -362,6 +468,7 @@ jobs:
           echo "ARTIFACT_FLAVOR=$flavor" >> "$GITHUB_ENV"
           echo "ARTIFACT_SIZE_KB=$size_kb" >> "$GITHUB_ENV"
           echo "ARTIFACT_NAME=immortalwrt-112m-${{ inputs.tag }}-${flavor}" >> "$GITHUB_ENV"
+
       - name: 写入构建摘要
         if: always()
         env:
@@ -390,6 +497,7 @@ jobs:
               echo "> Passwall 阶段编译失败，已自动退回基础固件。构建日志见 \`build-logs-*\` artifact。"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
       - name: 上传固件
         if: success()
         uses: actions/upload-artifact@v4
@@ -398,6 +506,7 @@ jobs:
           path: ${{ env.ARTIFACT_DIR }}/*
           if-no-files-found: error
           retention-days: 60
+
       - name: 上传构建日志
         if: always()
         uses: actions/upload-artifact@v4
@@ -406,6 +515,7 @@ jobs:
           path: |
             build-base.log
             build-passwall.log
+            build-error.txt
             openwrt/.config
             112m-changes.diff
           if-no-files-found: ignore

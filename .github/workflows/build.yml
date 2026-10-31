@@ -8,7 +8,7 @@ on:
         required: true
         default: "v25.12.2"
       extra_packages:
-        description: "额外软件包（空格分隔，可留空）"
+        description: "luci-app-passwall luci-i18n-firewall-zh-cn luci-i18n-package-manager-zh-cn luci-i18n-passwall-zh-cn luci-theme-argon"
         required: false
         default: ""
 

@@ -65,8 +65,13 @@ jobs:
             /usr/local/share/boost \
             /opt/az \
             /usr/share/swift \
-            /usr/local/lib/node_modules
+            /usr/local/lib/node_modules \
+            /usr/lib/jvm \
+            /usr/share/java \
+            /usr/local/share/chromium \
+            /opt/microsoft
           sudo apt-get clean
+          docker image prune -af >/dev/null 2>&1 || true
           df -h /
 
       - name: 安装编译依赖
@@ -264,9 +269,45 @@ jobs:
 
       - name: 编译基础固件（Argon + DAED）
         run: |
-          set -euo pipefail
+          set -uo pipefail
           cd "$OPENWRT_DIR"
-          make -j"$(nproc)" 2>&1 | tee ../build-base.log
+          df -h /
+
+          ok=0
+          for attempt in 1 2 3; do
+            set +e
+            make -j"$(nproc)" 2>&1 | tee -a ../build-base.log
+            rc=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$rc" -eq 0 ]; then
+              ok=1
+              break
+            fi
+
+            pkg=$(sed -n 's/^[[:space:]]*ERROR: \(package\/[^ ]*\) failed to build.*/\1/p' \
+                    ../build-base.log | head -n1)
+            echo "第 $attempt 次整体编译失败，失败包：${pkg:-未知}"
+            if [ -z "$pkg" ]; then
+              break
+            fi
+
+            # 用 V=s 单独重编失败包：依赖已经编译好，几分钟就能看到真实报错；
+            # 如果只是并行/内存抖动，这一步通常还能直接恢复。
+            set +e
+            make "$pkg/compile" V=s -j1 2>&1 | tee -a ../failed-pkg-rebuild.log
+            rc2=${PIPESTATUS[0]}
+            set -e
+            if [ "$rc2" -ne 0 ]; then
+              echo "ERROR: $pkg 单独编译仍然失败"
+              break
+            fi
+          done
+
+          if [ "$ok" -ne 1 ]; then
+            echo "ERROR: 基础固件编译失败"
+            exit 1
+          fi
           echo "=== 基础固件编译完成 ==="
 
       - name: 失败诊断（提取真实错误）
@@ -275,24 +316,42 @@ jobs:
           set -uo pipefail
 
           : > build-error.txt
-          for log in build-base.log build-passwall.log; do
+          {
+            echo "===== 环境 ====="
+            df -h / || true
+            free -h || true
+            sudo dmesg 2>/dev/null | grep -i -E "out of memory|killed process|oom" | tail -n 20 || true
+          } >> build-error.txt
+
+          for log in build-base.log failed-pkg-rebuild.log build-passwall.log; do
             [ -f "$log" ] || continue
             {
               echo "===== $log ====="
               echo "--- 关键字（最后 80 条）---"
-              grep -n -i -E "go: |error:|fatal|failed|Error [0-9]" "$log" | tail -n 80 || true
-              echo "--- 末尾 120 行 ---"
-              tail -n 120 "$log"
+              grep -n -i -E "go: |error:|fatal|failed|Error [0-9]|no space|killed" "$log" | tail -n 80 || true
+              echo "--- 末尾 160 行 ---"
+              tail -n 160 "$log"
               echo
             } >> build-error.txt
           done
+
+          # OpenWrt 的包级日志（如果存在）
+          if [ -d openwrt/logs ]; then
+            {
+              echo "===== openwrt/logs（daed/bpf/golang 相关）====="
+              find openwrt/logs -type f 2>/dev/null | grep -i -E "daed|bpf|golang" | while read -r f; do
+                echo "--- $f ---"
+                tail -n 200 "$f"
+              done
+            } >> build-error.txt
+          fi
 
           cat build-error.txt
           {
             echo ""
             echo "### 构建失败详情"
             echo '```'
-            tail -n 200 build-error.txt
+            tail -n 300 build-error.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
@@ -515,7 +574,9 @@ jobs:
           path: |
             build-base.log
             build-passwall.log
+            failed-pkg-rebuild.log
             build-error.txt
+            openwrt/logs
             openwrt/.config
             112m-changes.diff
           if-no-files-found: ignore

@@ -1,19 +1,17 @@
 # =============================================================================
-#  H3C NX30 Pro —— ImmortalWrt 112M 大分区自定义编译
+#  H3C NX30 Pro —— ImmortalWrt 112M 自定义编译（AdZero + Passwall/sing-box 版）
 #
-#  在官方 ImmortalWrt 源码上：
-#    1. 用 scripts/enable_112m.py 改成 112M 大分区（配合 Yuzhii U-Boot 的 112m 布局）
-#    2. 默认主题改为 luci-theme-argon（使用 ImmortalWrt luci 源自带版本，兼容性最好）
-#    3. 集成 ImmortalWrt 官方自带的 luci-app-daed + daed（走内核 BTF）
-#    4. 空间允许时再集成官方 luci-app-passwall（使用 Sing-Box 核心）
-#    5. 可选：用自定义 status.htm 替换 Passwall 状态页；把 daed 菜单名改为 Daed
+#  组成：
+#    * 默认主题 Argon
+#    * 集成 AdZero v0.23.6：LuCI → 服务 → AdZero，DNS 广告过滤
+#      （本体为 noarch 包，依赖 adblock-fast / tcpdump / conntrack / ucode）
+#    * Passwall 只编译 sing-box 内核，不再编译 xray-core
+#    * 仍然替换 Passwall 的 status.htm
+#    * 不再集成 honk / daed / dae
 #
-#  空间策略：
-#    先编译「Argon + DAED」基础固件并保存；确认能出固件后，再追加 Passwall
-#    做增量编译。若 Passwall 阶段失败（空间不足 / 依赖问题），自动退回只发布
-#    基础固件，保证每次至少有一个可刷的固件。
+#  AdZero 首次安装保护默认关闭，刷机后到 LuCI 里选择规则再开启。
 # =============================================================================
-name: build-immortalwrt-112m
+name: build-immortalwrt-112m-adzero
 
 on:
   workflow_dispatch:
@@ -23,7 +21,7 @@ on:
         required: true
         default: "v25.12.2"
       with_passwall:
-        description: "尝试集成 luci-app-passwall（失败或空间不足会自动退回不含 Passwall 的固件）"
+        description: "是否集成 luci-app-passwall（sing-box 内核）"
         type: boolean
         default: true
       passwall_status_htm:
@@ -39,17 +37,17 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-immortalwrt-112m-${{ github.ref }}
+  group: build-immortalwrt-112m-adzero-${{ github.ref }}
   cancel-in-progress: false
 
 env:
   OPENWRT_DIR: openwrt
-  # enable_112m.py 把该设备 IMAGE_SIZE 改成 114688k（112M）
   IMAGE_LIMIT_KB: "114688"
+  ADZERO_VERSION: "0.23.6"
 
 jobs:
   build:
-    name: 编译 NX30PRO 112M 固件
+    name: 编译 NX30PRO 112M 固件（AdZero + sing-box）
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
@@ -112,54 +110,46 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 修改官方 luci-app-daed 菜单显示名（daed -> Daed）
-        run: |
-          set -euo pipefail
-          cd "$OPENWRT_DIR"
-
-          DAED_MENU=$(find feeds/luci -path '*luci-app-daed/root/usr/share/luci/menu.d/luci-app-daed.json' | head -n1)
-          if [ -z "$DAED_MENU" ]; then
-            echo "ERROR: 找不到官方 luci-app-daed 的菜单文件"
-            exit 1
-          fi
-          sed -i -E 's/("title"[[:space:]]*:[[:space:]]*)"daed"/\1"Daed"/' "$DAED_MENU"
-          grep -q '"Daed"' "$DAED_MENU" || {
-            echo "ERROR: 修改 luci-app-daed 菜单名失败"; exit 1; }
-          echo "菜单文件：$DAED_MENU"
-          grep -n '"title"' "$DAED_MENU" | head -n 3
-
-      - name: 移除 Passwall 冲突包并加入 Passwall 源码
+      - name: 加入 Passwall 与 AdZero 源码
         env:
           STATUS_URL: ${{ inputs.passwall_status_htm }}
         run: |
           set -euo pipefail
           cd "$OPENWRT_DIR"
 
-          # Passwall 上游 README 要求：先删掉 openwrt 源里同名的核心包，
-          # 避免 package/feeds 与 package/ 下出现同名包导致版本/依赖混乱。
-          # 注意保留 v2ray-geodata：官方 daed-geoip / daed-geosite 需要它；
-          # passwall-packages 里自带的同名包在下面会删掉。
-          for p in xray-core sing-box chinadns-ng dns2socks hysteria \
+          # Passwall 上游 README 要求：先删掉 openwrt 源里同名的核心包
+          for p in xray-core v2ray-geodata sing-box chinadns-ng dns2socks hysteria \
                    ipt2socks microsocks naiveproxy shadowsocks-rust shadowsocksr-libev \
                    simple-obfs tcping v2ray-plugin xray-plugin geoview shadow-tls smartdns; do
             rm -rf "feeds/packages/net/$p" "package/feeds/packages/$p"
           done
           rm -rf feeds/luci/applications/luci-app-passwall package/feeds/luci/luci-app-passwall
 
-          # Passwall：官方源（Openwrt-Passwall 组织），按上游 README 直接放进 package/
           git clone --depth 1 https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git \
             package/passwall-packages
           git clone --depth 1 https://github.com/Openwrt-Passwall/openwrt-passwall.git \
             package/passwall-luci
 
-          # 统一使用官方源的 v2ray-geodata（daed-geoip 依赖它）
-          rm -rf package/passwall-packages/v2ray-geodata
+          # AdZero：LuCI 广告过滤，固定使用实测过的 v0.23.6 源码
+          git clone --depth 1 --branch "v${ADZERO_VERSION}" \
+            https://github.com/slobys/AdZero.git /tmp/adzero-src
+          rm -rf feeds/luci/applications/luci-app-adzero package/feeds/luci/luci-app-adzero
+          cp -a /tmp/adzero-src/luci-app-adzero package/luci-app-adzero
+          test -f package/luci-app-adzero/Makefile
+          test -f package/luci-app-adzero/root/etc/config/adzero
+          grep -q "PKG_VERSION:=${ADZERO_VERSION}" package/luci-app-adzero/Makefile
+          rm -rf /tmp/adzero-src
+
+          # 25.12 官方源没有 lyaml，去掉这条依赖以免 Kconfig 告警
+          sed -i 's/ +lyaml//' package/passwall-luci/luci-app-passwall/Makefile || true
+          if grep -q 'lyaml' package/passwall-luci/luci-app-passwall/Makefile; then
+            echo "::warning::luci-app-passwall 仍依赖 lyaml（官方源已移除该包），构建时将忽略"
+          fi
 
           # 可选：替换 Passwall 状态页 status.htm
           # 来源优先级：workflow 输入 passwall_status_htm > 仓库根目录 luci-app-passwall/status.htm
           STATUS_SRC=""
           if [ -n "${STATUS_URL:-}" ]; then
-            # 支持直接粘贴 github.com/.../blob/... 链接
             STATUS_URL=$(printf '%s' "$STATUS_URL" | sed -E \
               's#^https://github\.com/([^/]+)/([^/]+)/blob/(.+)$#https://raw.githubusercontent.com/\1/\2/\3#')
             curl -fsSL "$STATUS_URL" -o /tmp/passwall-status.htm
@@ -173,34 +163,19 @@ jobs:
               echo "ERROR: $STATUS_SRC 不像 HTML 文件"; exit 1; }
             DST=package/passwall-luci/luci-app-passwall/luasrc/view/passwall/global/status.htm
             cp -f "$STATUS_SRC" "$DST"
-            # 有些固件的 LuCI 视图在 /usr/lib64 下，额外放一份覆盖文件
             mkdir -p files/usr/lib64/lua/luci/view/passwall/global
             cp -f "$STATUS_SRC" files/usr/lib64/lua/luci/view/passwall/global/status.htm
             echo "已替换 Passwall 状态页："
             head -n 5 "$DST"
           else
-            echo "::warning::没有提供 status.htm（输入为空且仓库无 luci-app-passwall/status.htm），保持默认状态页"
+            echo "::warning::没有提供 status.htm，保持默认状态页"
           fi
-
-          # 25.12 官方源已经没有 lyaml 这个包，去掉这条依赖以免 Kconfig 告警。
-          # 这里只做“尽量清理”，即使上游改了写法也不会中断编译。
-          sed -i 's/ +lyaml//' package/passwall-luci/luci-app-passwall/Makefile || true
-          if grep -q 'lyaml' package/passwall-luci/luci-app-passwall/Makefile; then
-            echo "::warning::luci-app-passwall 仍依赖 lyaml（官方源已移除该包），构建时将忽略此依赖"
-          fi
-
-          # 确认关键包目录都在
-          test -f feeds/packages/net/daed/Makefile
-          test -f feeds/packages/net/v2ray-geodata/Makefile
-          test -f package/passwall-luci/luci-app-passwall/Makefile
 
       - name: 设置默认主题为 Argon
         run: |
           set -euo pipefail
           cd "$OPENWRT_DIR"
 
-          # LuCI 的集合包（luci-light 等）里默认依赖 luci-theme-bootstrap，
-          # 全部替换成 luci-theme-argon，这样镜像里不会再装 bootstrap。
           mapfile -t collections < <(grep -rl 'luci-theme-bootstrap' feeds/luci/collections || true)
           if [ "${#collections[@]}" -gt 0 ]; then
             sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' "${collections[@]}"
@@ -209,7 +184,6 @@ jobs:
             echo "::warning::feeds/luci/collections 中没有 luci-theme-bootstrap，跳过集合依赖替换"
           fi
 
-          # 首次启动再兜底写一次 mediaurlbase（sysupgrade 保留配置时不会重复执行）
           mkdir -p files/etc/uci-defaults
           cat > files/etc/uci-defaults/99-default-argon <<'EOF'
           #!/bin/sh
@@ -220,7 +194,7 @@ jobs:
           EOF
           chmod +x files/etc/uci-defaults/99-default-argon
 
-      - name: 生成基础配置（Argon + DAED）
+      - name: 生成基础配置（Argon + AdZero）
         env:
           EXTRA_PACKAGES: ${{ inputs.extra_packages }}
         run: |
@@ -234,18 +208,7 @@ jobs:
           CONFIG_TARGET_mediatek_filogic_DEVICE_h3c_magic-nx30-pro=y
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-theme-argon=y
-          CONFIG_PACKAGE_luci-app-daed=y
-          CONFIG_PACKAGE_luci-i18n-daed-zh-cn=y
-          CONFIG_PACKAGE_daed=y
-          CONFIG_PACKAGE_daed-geoip=y
-          CONFIG_PACKAGE_daed-geosite=y
-          # DAED 的 eBPF CO-RE 需要内核 BTF / BPF events / XDP sockets。
-          # 普通自编译默认是“精简调试信息 + 无 BTF”，这里按 buildbot 的配置打开。
-          CONFIG_KERNEL_DEBUG_INFO=y
-          CONFIG_KERNEL_DEBUG_INFO_REDUCED=n
-          CONFIG_KERNEL_DEBUG_INFO_BTF=y
-          CONFIG_KERNEL_BPF_EVENTS=y
-          CONFIG_KERNEL_XDP_SOCKETS=y
+          CONFIG_PACKAGE_luci-app-adzero=y
           EOF
 
           for p in $EXTRA_PACKAGES; do
@@ -257,20 +220,16 @@ jobs:
           echo "=== 目标设备 ==="
           grep -E '^CONFIG_TARGET_(mediatek|.*DEVICE)' .config || true
           echo "=== 关键软件包 ==="
-          grep -E '^CONFIG_PACKAGE_(luci|luci-theme-argon|luci-app-daed|daed|daed-geoip|daed-geosite)=' .config || true
+          grep -E '^CONFIG_PACKAGE_(luci|luci-theme-argon|luci-app-adzero|adblock-fast|tcpdump)=' .config || true
 
           grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_h3c_magic-nx30-pro=y' .config || {
             echo "ERROR: 没有选中 h3c_magic-nx30-pro"; exit 1; }
           grep -q '^CONFIG_PACKAGE_luci-theme-argon=y' .config || {
             echo "ERROR: luci-theme-argon 没有被选中"; exit 1; }
-          grep -q '^CONFIG_PACKAGE_luci-app-daed=y' .config || {
-            echo "ERROR: luci-app-daed 没有被选中"; exit 1; }
-          grep -q '^CONFIG_PACKAGE_daed=y' .config || {
-            echo "ERROR: daed 没有被选中（检查 BTF / BPF_EVENTS / XDP_SOCKETS）"; exit 1; }
-          grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config || {
-            echo "ERROR: 内核 BTF 没有开启，daed 无法运行"; exit 1; }
-
-          grep -E '^CONFIG_KERNEL_(DEBUG_INFO|DEBUG_INFO_BTF|BPF_EVENTS|XDP_SOCKETS)' .config || true
+          grep -q '^CONFIG_PACKAGE_luci-app-adzero=y' .config || {
+            echo "ERROR: luci-app-adzero 没有被选中（检查 adblock-fast / tcpdump / ucode 依赖）"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_adblock-fast=y' .config || {
+            echo "ERROR: adblock-fast 没有被选中"; exit 1; }
 
       - name: 预下载源码包
         continue-on-error: true
@@ -278,7 +237,7 @@ jobs:
           cd "$OPENWRT_DIR"
           make -j"$(nproc)" download
 
-      - name: 编译基础固件（Argon + DAED）
+      - name: 编译基础固件（Argon + AdZero）
         run: |
           set -uo pipefail
           cd "$OPENWRT_DIR"
@@ -303,8 +262,6 @@ jobs:
               break
             fi
 
-            # 用 V=s 单独重编失败包：依赖已经编译好，几分钟就能看到真实报错；
-            # 如果只是并行/内存抖动，这一步通常还能直接恢复。
             set +e
             make "$pkg/compile" V=s -j1 2>&1 | tee -a ../failed-pkg-rebuild.log
             rc2=${PIPESTATUS[0]}
@@ -346,11 +303,10 @@ jobs:
             } >> build-error.txt
           done
 
-          # OpenWrt 的包级日志（如果存在）
           if [ -d openwrt/logs ]; then
             {
-              echo "===== openwrt/logs（daed/bpf/golang 相关）====="
-              find openwrt/logs -type f 2>/dev/null | grep -i -E "daed|bpf|golang" | while read -r f; do
+              echo "===== openwrt/logs（adzero/singbox/golang 相关）====="
+              find openwrt/logs -type f 2>/dev/null | grep -i -E "adzero|adblock|sing|golang" | while read -r f; do
                 echo "--- $f ---"
                 tail -n 200 "$f"
               done
@@ -401,22 +357,27 @@ jobs:
             exit 1
           fi
 
-      - name: 追加 Passwall 配置
+      - name: 追加 Passwall 配置（sing-box 内核）
         if: ${{ inputs.with_passwall }}
         run: |
           set -euo pipefail
           cd "$OPENWRT_DIR"
 
           cat >> .config <<'EOF'
-          # Passwall 只保留 Sing-Box 核心，其余可选组件全部关掉以节省 112M 空间
+          # Passwall 只保留 sing-box 内核
           CONFIG_PACKAGE_dnsmasq=n
           CONFIG_PACKAGE_dnsmasq-full=y
           CONFIG_PACKAGE_ip-tiny=n
           CONFIG_PACKAGE_ip-full=y
           CONFIG_PACKAGE_luci-app-passwall=y
           CONFIG_PACKAGE_luci-i18n-passwall-zh-cn=y
+          CONFIG_PACKAGE_sing-box=y
           CONFIG_PACKAGE_luci-app-passwall_Iptables_Transparent_Proxy=n
           CONFIG_PACKAGE_luci-app-passwall_Nftables_Transparent_Proxy=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SingBox=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Geodata=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray_Plugin=n
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_GeoView=n
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SmartDNS=n
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Haproxy=n
@@ -428,17 +389,11 @@ jobs:
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_ShadowsocksR_Libev_Client=n
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_ShadowsocksR_Libev_Server=n
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Simple_Obfs=n
-          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SingBox=y
-          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Geodata=n
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Plugin=n
-          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray=n
-          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray_Plugin=n
           EOF
 
           make defconfig
 
-          # dnsmasq-full / ip-full 与默认的 dnsmasq / ip-tiny 冲突，
-          # 反复几轮确保默认包被彻底关掉
           for _ in 1 2 3; do
             changed=0
             if grep -q '^CONFIG_PACKAGE_dnsmasq=y' .config; then
@@ -455,23 +410,38 @@ jobs:
             make defconfig
           done
 
-          echo "=== Passwall 相关配置 ==="
-          grep -E '^CONFIG_PACKAGE_(luci-app-passwall|dnsmasq|ip-full|ip-tiny|sing-box)' .config || true
+          echo "=== Passwall / sing-box 配置 ==="
+          grep -E '^CONFIG_PACKAGE_(luci-app-passwall|sing-box|dnsmasq|ip-full|ip-tiny)' .config || true
 
           if ! grep -q '^CONFIG_PACKAGE_luci-app-passwall=y' .config; then
             echo "PASSWALL_STATUS=skipped" >> "$GITHUB_ENV"
-            echo "::warning::luci-app-passwall 没有被选中（依赖不满足），本次只发布基础固件"
+            echo "::warning::luci-app-passwall 没有被选中，本次只发布 AdZero 基础固件"
             exit 0
           fi
           if ! grep -q '^CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SingBox=y' .config; then
             echo "PASSWALL_STATUS=skipped" >> "$GITHUB_ENV"
-            echo "::warning::Passwall 的 Sing-Box 核心没有选中，本次只发布基础固件"
+            echo "::warning::Passwall 的 sing-box 内核没有选中，本次只发布基础固件"
+            exit 0
+          fi
+          if ! grep -q '^CONFIG_PACKAGE_sing-box=y' .config; then
+            echo "PASSWALL_STATUS=skipped" >> "$GITHUB_ENV"
+            echo "::warning::sing-box 没有被选中，本次只发布基础固件"
+            exit 0
+          fi
+          if ! grep -q '^CONFIG_PACKAGE_luci-app-adzero=y' .config; then
+            echo "PASSWALL_STATUS=skipped" >> "$GITHUB_ENV"
+            echo "::warning::加入 Passwall 后 luci-app-adzero 被丢弃，本次只发布 AdZero 基础固件"
+            exit 0
+          fi
+          if ! grep -q '^CONFIG_PACKAGE_adblock-fast=y' .config; then
+            echo "PASSWALL_STATUS=skipped" >> "$GITHUB_ENV"
+            echo "::warning::加入 Passwall 后 adblock-fast 被丢弃，本次只发布 AdZero 基础固件"
             exit 0
           fi
 
           echo "PASSWALL_STATUS=pending" >> "$GITHUB_ENV"
 
-      - name: 编译含 Passwall 的固件
+      - name: 编译含 Passwall(sing-box) 的固件
         if: ${{ inputs.with_passwall && env.PASSWALL_STATUS == 'pending' }}
         run: |
           set -euo pipefail
@@ -484,7 +454,7 @@ jobs:
 
           if [ "$rc" -ne 0 ]; then
             echo "PASSWALL_STATUS=failed" >> "$GITHUB_ENV"
-            echo "::warning::加入 Passwall 后编译失败（多半是 112M 空间不足），本次只发布基础固件，详见 build-passwall.log"
+            echo "::warning::加入 Passwall(sing-box) 后编译失败，本次只发布 AdZero 基础固件，详见 build-passwall.log"
             exit 0
           fi
 
@@ -492,7 +462,7 @@ jobs:
           files=(bin/targets/mediatek/filogic/*.itb)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "PASSWALL_STATUS=failed" >> "$GITHUB_ENV"
-            echo "::warning::没有生成带 Passwall 的固件，本次只发布基础固件"
+            echo "::warning::没有生成含 Passwall 的固件，本次只发布基础固件"
             exit 0
           fi
 
@@ -526,7 +496,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${PASSWALL_STATUS:-}" = "ok" ] && ls out/passwall/*-squashfs-sysupgrade.itb >/dev/null 2>&1; then
-            flavor="with-passwall"
+            flavor="singbox"
             size_kb="$PASSWALL_SIZE_KB"
             dir="out/passwall"
           else
@@ -537,7 +507,7 @@ jobs:
           echo "ARTIFACT_DIR=$dir" >> "$GITHUB_ENV"
           echo "ARTIFACT_FLAVOR=$flavor" >> "$GITHUB_ENV"
           echo "ARTIFACT_SIZE_KB=$size_kb" >> "$GITHUB_ENV"
-          echo "ARTIFACT_NAME=immortalwrt-112m-${{ inputs.tag }}-${flavor}" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=immortalwrt-112m-${{ inputs.tag }}-adzero-${flavor}" >> "$GITHUB_ENV"
 
       - name: 写入构建摘要
         if: always()
@@ -546,15 +516,16 @@ jobs:
         run: |
           set -uo pipefail
           {
-            echo "## NX30PRO 112M 固件构建结果"
+            echo "## NX30PRO 112M 固件构建结果（AdZero + sing-box）"
             echo ""
             echo "| 项目 | 值 |"
             echo "| --- | --- |"
             echo "| 任务状态 | ${{ job.status }} |"
             echo "| ImmortalWrt | \`${TAG}\` |"
             echo "| 默认主题 | luci-theme-argon |"
-            echo "| DAED | luci-app-daed + daed（内核 BTF） |"
-            echo "| Passwall | ${PASSWALL_STATUS:-未启用} |"
+            echo "| AdZero | v${ADZERO_VERSION}（adblock-fast，默认关闭） |"
+            echo "| LuCI 菜单 | 服务 → AdZero |"
+            echo "| Passwall | ${PASSWALL_STATUS:-未启用}（sing-box 内核） |"
             echo "| 发布固件 | ${ARTIFACT_NAME:-未生成} |"
             echo "| 固件大小 | ${ARTIFACT_SIZE_KB:-未知} KB（上限 114688 KB） |"
             echo ""
@@ -564,7 +535,7 @@ jobs:
             echo '```'
             echo ""
             if [ "${PASSWALL_STATUS:-}" = "failed" ]; then
-              echo "> Passwall 阶段编译失败，已自动退回基础固件。构建日志见 \`build-logs-*\` artifact。"
+              echo "> Passwall 阶段编译失败，已自动退回只含 AdZero 的基础固件。构建日志见 \`build-logs-*\` artifact。"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 

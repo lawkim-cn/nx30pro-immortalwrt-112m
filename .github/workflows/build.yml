@@ -8,6 +8,7 @@
 #       注意：daed 的 go.mod 要求 Go >= 1.27.0，官方 25.12 源自带的 Go 太旧，
 #       工作流会用 kenzok8/golang 的 1.27 分支（1.27.3）替换官方 golang 包。
 #    4. 空间允许时再集成官方 luci-app-passwall（仅保留 Xray 核心，尽量省空间）
+#    5. 可选：用自定义 status.htm 替换 Passwall 状态页；把 daede 菜单名改为 Daed
 #
 #  空间策略：
 #    先编译「Argon + DAED」基础固件并保存；确认能出固件后，再追加 Passwall
@@ -27,6 +28,10 @@ on:
         description: "尝试集成 luci-app-passwall（失败或空间不足会自动退回不含 Passwall 的固件）"
         type: boolean
         default: true
+      passwall_status_htm:
+        description: "自定义 Passwall status.htm 的 raw 链接（留空则读取仓库根目录 luci-app-passwall/status.htm）"
+        required: false
+        default: ""
       extra_packages:
         description: "额外软件包（空格分隔，可留空）"
         required: false
@@ -138,6 +143,8 @@ jobs:
           test -f package/feeds/packages/golang/Makefile
 
       - name: 移除冲突包并加入 DAED / Passwall 源码
+        env:
+          STATUS_URL: ${{ inputs.passwall_status_htm }}
         run: |
           set -euo pipefail
           cd "$OPENWRT_DIR"
@@ -166,11 +173,45 @@ jobs:
           git clone --depth 1 https://github.com/kenzok8/openwrt-daede.git \
             package/openwrt-daede
 
+          # admin/services 菜单显示名：daede -> Daed
+          MENU_JSON=package/openwrt-daede/luci-app-daede/root/usr/share/luci/menu.d/luci-app-daede.json
+          sed -i -E 's/("title"[[:space:]]*:[[:space:]]*)"daede"/\1"Daed"/' "$MENU_JSON"
+          grep -q '"Daed"' "$MENU_JSON" || {
+            echo "ERROR: 修改 luci-app-daede 菜单名失败"; exit 1; }
+          grep -n '"title"' "$MENU_JSON" | head -n 3
+
           # Passwall：官方源（Openwrt-Passwall 组织），按上游 README 直接放进 package/
           git clone --depth 1 https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git \
             package/passwall-packages
           git clone --depth 1 https://github.com/Openwrt-Passwall/openwrt-passwall.git \
             package/passwall-luci
+
+          # 可选：替换 Passwall 状态页 status.htm
+          # 来源优先级：workflow 输入 passwall_status_htm > 仓库根目录 luci-app-passwall/status.htm
+          STATUS_SRC=""
+          if [ -n "${STATUS_URL:-}" ]; then
+            # 支持直接粘贴 github.com/.../blob/... 链接
+            STATUS_URL=$(printf '%s' "$STATUS_URL" | sed -E \
+              's#^https://github\.com/([^/]+)/([^/]+)/blob/(.+)$#https://raw.githubusercontent.com/\1/\2/\3#')
+            curl -fsSL "$STATUS_URL" -o /tmp/passwall-status.htm
+            STATUS_SRC=/tmp/passwall-status.htm
+          elif [ -f ../luci-app-passwall/status.htm ]; then
+            STATUS_SRC=../luci-app-passwall/status.htm
+          fi
+
+          if [ -n "$STATUS_SRC" ]; then
+            grep -qi '<' "$STATUS_SRC" || {
+              echo "ERROR: $STATUS_SRC 不像 HTML 文件"; exit 1; }
+            DST=package/passwall-luci/luci-app-passwall/luasrc/view/passwall/global/status.htm
+            cp -f "$STATUS_SRC" "$DST"
+            # 有些固件的 LuCI 视图在 /usr/lib64 下，额外放一份覆盖文件
+            mkdir -p files/usr/lib64/lua/luci/view/passwall/global
+            cp -f "$STATUS_SRC" files/usr/lib64/lua/luci/view/passwall/global/status.htm
+            echo "已替换 Passwall 状态页："
+            head -n 5 "$DST"
+          else
+            echo "::warning::没有提供 status.htm（输入为空且仓库无 luci-app-passwall/status.htm），保持默认状态页"
+          fi
 
           # 25.12 官方源已经没有 lyaml 这个包，去掉这条依赖以免 Kconfig 告警。
           # 这里只做“尽量清理”，即使上游改了写法也不会中断编译。

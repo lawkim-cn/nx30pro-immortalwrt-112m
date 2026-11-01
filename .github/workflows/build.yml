@@ -4,11 +4,9 @@
 #  在官方 ImmortalWrt 源码上：
 #    1. 用 scripts/enable_112m.py 改成 112M 大分区（配合 Yuzhii U-Boot 的 112m 布局）
 #    2. 默认主题改为 luci-theme-argon（使用 ImmortalWrt luci 源自带版本，兼容性最好）
-#    3. 集成 kenzok8/openwrt-daede（luci-app-daede + daed，走内核 BTF）
-#       注意：daed 的 go.mod 要求 Go >= 1.27.0，官方 25.12 源自带的 Go 太旧，
-#       工作流会用 kenzok8/golang 的 1.27 分支（1.27.3）替换官方 golang 包。
-#    4. 空间允许时再集成官方 luci-app-passwall（仅保留 Xray 核心，尽量省空间）
-#    5. 可选：用自定义 status.htm 替换 Passwall 状态页；把 daede 菜单名改为 Daed
+#    3. 集成 ImmortalWrt 官方自带的 luci-app-daed + daed（走内核 BTF）
+#    4. 空间允许时再集成官方 luci-app-passwall（使用 Sing-Box 核心）
+#    5. 可选：用自定义 status.htm 替换 Passwall 状态页；把 daed 菜单名改为 Daed
 #
 #  空间策略：
 #    先编译「Argon + DAED」基础固件并保存；确认能出固件后，再追加 Passwall
@@ -114,35 +112,23 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 升级 Golang 到 1.27.3（daed 要求）
+      - name: 修改官方 luci-app-daed 菜单显示名（daed -> Daed）
         run: |
           set -euo pipefail
           cd "$OPENWRT_DIR"
 
-          # daed 的 wing/go.mod 和 outbound/go.mod 都要求 go >= 1.27.0，而 25.12
-          # 官方源里的 golang1.26 只有 1.26.8；golang-package.mk 又固定了
-          # GOTOOLCHAIN=local，不会自动下载新工具链，所以会报
-          # "go.mod requires go >= 1.27.0"。
-          # 用 kenzok8/golang 的 1.27 分支（当前是 1.27.3）整体替换官方 golang。
-          # 该仓库本身就是 feed 结构：golang/Makefile + 根目录的 golang-*.mk，
-          # 与 feeds/packages/lang/golang 的布局一致，直接 clone 即可。
-          rm -rf feeds/packages/lang/golang \
-                 package/feeds/packages/golang1.26 \
-                 package/feeds/packages/golang1.27 \
-                 package/feeds/packages/golang-bootstrap
-          git clone --depth 1 -b 1.27 https://github.com/kenzok8/golang.git \
-                feeds/packages/lang/golang
-          # 重新指向新的包目录（kenzok8 仓库里包在 golang/ 子目录）
-          ln -sfn ../../../feeds/packages/lang/golang/golang \
-                package/feeds/packages/golang
+          DAED_MENU=$(find feeds/luci -path '*luci-app-daed/root/usr/share/luci/menu.d/luci-app-daed.json' | head -n1)
+          if [ -z "$DAED_MENU" ]; then
+            echo "ERROR: 找不到官方 luci-app-daed 的菜单文件"
+            exit 1
+          fi
+          sed -i -E 's/("title"[[:space:]]*:[[:space:]]*)"daed"/\1"Daed"/' "$DAED_MENU"
+          grep -q '"Daed"' "$DAED_MENU" || {
+            echo "ERROR: 修改 luci-app-daed 菜单名失败"; exit 1; }
+          echo "菜单文件：$DAED_MENU"
+          grep -n '"title"' "$DAED_MENU" | head -n 3
 
-          echo "=== 使用的 Go 版本 ==="
-          grep -E '^(GO_VERSION_MAJOR_MINOR|GO_VERSION_PATCH)' \
-                feeds/packages/lang/golang/golang/Makefile
-          test -f feeds/packages/lang/golang/golang-package.mk
-          test -f package/feeds/packages/golang/Makefile
-
-      - name: 移除冲突包并加入 DAED / Passwall 源码
+      - name: 移除 Passwall 冲突包并加入 Passwall 源码
         env:
           STATUS_URL: ${{ inputs.passwall_status_htm }}
         run: |
@@ -151,40 +137,23 @@ jobs:
 
           # Passwall 上游 README 要求：先删掉 openwrt 源里同名的核心包，
           # 避免 package/feeds 与 package/ 下出现同名包导致版本/依赖混乱。
-          for p in xray-core v2ray-geodata sing-box chinadns-ng dns2socks hysteria \
+          # 注意保留 v2ray-geodata：官方 daed-geoip / daed-geosite 需要它；
+          # passwall-packages 里自带的同名包在下面会删掉。
+          for p in xray-core sing-box chinadns-ng dns2socks hysteria \
                    ipt2socks microsocks naiveproxy shadowsocks-rust shadowsocksr-libev \
                    simple-obfs tcping v2ray-plugin xray-plugin geoview shadow-tls smartdns; do
             rm -rf "feeds/packages/net/$p" "package/feeds/packages/$p"
           done
           rm -rf feeds/luci/applications/luci-app-passwall package/feeds/luci/luci-app-passwall
 
-          # ImmortalWrt 自带 dae / daed / luci-app-daed，与 kenzok8/openwrt-daede
-          # 里的包同名，必须先移除，否则 Kconfig 会出现重复包。
-          for p in dae daed; do
-            rm -rf "feeds/packages/net/$p" "package/feeds/packages/$p"
-          done
-          rm -rf feeds/luci/applications/luci-app-daed package/feeds/luci/luci-app-daed
-          rm -rf feeds/luci/applications/luci-app-dae  package/feeds/luci/luci-app-dae
-
-          # 主题：luci-theme-argon 已经包含在 ImmortalWrt 的 luci feed 里，
-          # 直接选用即可（不额外 clone，避免与 feed 内同名包冲突）。
-
-          # DAED：仓库内含 dae / daed / luci-app-daede / vmlinux-btf
-          git clone --depth 1 https://github.com/kenzok8/openwrt-daede.git \
-            package/openwrt-daede
-
-          # admin/services 菜单显示名：daede -> Daed
-          MENU_JSON=package/openwrt-daede/luci-app-daede/root/usr/share/luci/menu.d/luci-app-daede.json
-          sed -i -E 's/("title"[[:space:]]*:[[:space:]]*)"daede"/\1"Daed"/' "$MENU_JSON"
-          grep -q '"Daed"' "$MENU_JSON" || {
-            echo "ERROR: 修改 luci-app-daede 菜单名失败"; exit 1; }
-          grep -n '"title"' "$MENU_JSON" | head -n 3
-
           # Passwall：官方源（Openwrt-Passwall 组织），按上游 README 直接放进 package/
           git clone --depth 1 https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git \
             package/passwall-packages
           git clone --depth 1 https://github.com/Openwrt-Passwall/openwrt-passwall.git \
             package/passwall-luci
+
+          # 统一使用官方源的 v2ray-geodata（daed-geoip 依赖它）
+          rm -rf package/passwall-packages/v2ray-geodata
 
           # 可选：替换 Passwall 状态页 status.htm
           # 来源优先级：workflow 输入 passwall_status_htm > 仓库根目录 luci-app-passwall/status.htm
@@ -221,8 +190,8 @@ jobs:
           fi
 
           # 确认关键包目录都在
-          test -f package/openwrt-daede/luci-app-daede/Makefile
-          test -f package/passwall-packages/v2ray-geodata/Makefile
+          test -f feeds/packages/net/daed/Makefile
+          test -f feeds/packages/net/v2ray-geodata/Makefile
           test -f package/passwall-luci/luci-app-passwall/Makefile
 
       - name: 设置默认主题为 Argon
@@ -265,16 +234,18 @@ jobs:
           CONFIG_TARGET_mediatek_filogic_DEVICE_h3c_magic-nx30-pro=y
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-theme-argon=y
-          CONFIG_PACKAGE_luci-app-daede=y
-          CONFIG_PACKAGE_luci-app-daede_daed=y
+          CONFIG_PACKAGE_luci-app-daed=y
+          CONFIG_PACKAGE_luci-i18n-daed-zh-cn=y
           CONFIG_PACKAGE_daed=y
-          # 默认只装 daed 内核；要用 dae 内核把下面改成 y（约多占 10MB）
-          CONFIG_PACKAGE_dae=n
-          # DAED 的 eBPF CO-RE 需要内核 BTF。普通自编译默认是“精简调试信息 + 无 BTF”，
-          # 这里按 buildbot 的配置打开（BTF 只增加几 MB，但 daed 才能正常启动）。
+          CONFIG_PACKAGE_daed-geoip=y
+          CONFIG_PACKAGE_daed-geosite=y
+          # DAED 的 eBPF CO-RE 需要内核 BTF / BPF events / XDP sockets。
+          # 普通自编译默认是“精简调试信息 + 无 BTF”，这里按 buildbot 的配置打开。
           CONFIG_KERNEL_DEBUG_INFO=y
           CONFIG_KERNEL_DEBUG_INFO_REDUCED=n
           CONFIG_KERNEL_DEBUG_INFO_BTF=y
+          CONFIG_KERNEL_BPF_EVENTS=y
+          CONFIG_KERNEL_XDP_SOCKETS=y
           EOF
 
           for p in $EXTRA_PACKAGES; do
@@ -286,23 +257,20 @@ jobs:
           echo "=== 目标设备 ==="
           grep -E '^CONFIG_TARGET_(mediatek|.*DEVICE)' .config || true
           echo "=== 关键软件包 ==="
-          grep -E '^CONFIG_PACKAGE_(luci|luci-theme-argon|luci-app-daede|daed)=' .config || true
+          grep -E '^CONFIG_PACKAGE_(luci|luci-theme-argon|luci-app-daed|daed|daed-geoip|daed-geosite)=' .config || true
 
           grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_h3c_magic-nx30-pro=y' .config || {
             echo "ERROR: 没有选中 h3c_magic-nx30-pro"; exit 1; }
           grep -q '^CONFIG_PACKAGE_luci-theme-argon=y' .config || {
             echo "ERROR: luci-theme-argon 没有被选中"; exit 1; }
-          grep -q '^CONFIG_PACKAGE_luci-app-daede=y' .config || {
-            echo "ERROR: luci-app-daede 没有被选中"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_luci-app-daed=y' .config || {
+            echo "ERROR: luci-app-daed 没有被选中"; exit 1; }
           grep -q '^CONFIG_PACKAGE_daed=y' .config || {
-            echo "ERROR: daed 没有被选中（检查内核 BTF / XDP_SOCKETS 配置）"; exit 1; }
+            echo "ERROR: daed 没有被选中（检查 BTF / BPF_EVENTS / XDP_SOCKETS）"; exit 1; }
+          grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config || {
+            echo "ERROR: 内核 BTF 没有开启，daed 无法运行"; exit 1; }
 
-          # 记录 DAED 使用的是内核 BTF 还是 vmlinux-btf
-          grep -E '^CONFIG_DAED_USE_' .config || true
-          grep -E '^CONFIG_KERNEL_(DEBUG_INFO|DEBUG_INFO_BTF|XDP_SOCKETS)' .config || true
-          if ! grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config; then
-            echo "::warning::内核 BTF 没有开启，DAED 会退回 vmlinux-btf（可能在运行时匹配不上内核）"
-          fi
+          grep -E '^CONFIG_KERNEL_(DEBUG_INFO|DEBUG_INFO_BTF|BPF_EVENTS|XDP_SOCKETS)' .config || true
 
       - name: 预下载源码包
         continue-on-error: true
@@ -440,7 +408,7 @@ jobs:
           cd "$OPENWRT_DIR"
 
           cat >> .config <<'EOF'
-          # Passwall 只保留 Xray 核心，其余可选组件全部关掉以节省 112M 空间
+          # Passwall 只保留 Sing-Box 核心，其余可选组件全部关掉以节省 112M 空间
           CONFIG_PACKAGE_dnsmasq=n
           CONFIG_PACKAGE_dnsmasq-full=y
           CONFIG_PACKAGE_ip-tiny=n
@@ -460,10 +428,10 @@ jobs:
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_ShadowsocksR_Libev_Client=n
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_ShadowsocksR_Libev_Server=n
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Simple_Obfs=n
-          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SingBox=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SingBox=y
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Geodata=n
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Plugin=n
-          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray=n
           CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray_Plugin=n
           EOF
 
@@ -488,16 +456,16 @@ jobs:
           done
 
           echo "=== Passwall 相关配置 ==="
-          grep -E '^CONFIG_PACKAGE_(luci-app-passwall|dnsmasq|ip-full|ip-tiny|xray)' .config || true
+          grep -E '^CONFIG_PACKAGE_(luci-app-passwall|dnsmasq|ip-full|ip-tiny|sing-box)' .config || true
 
           if ! grep -q '^CONFIG_PACKAGE_luci-app-passwall=y' .config; then
             echo "PASSWALL_STATUS=skipped" >> "$GITHUB_ENV"
             echo "::warning::luci-app-passwall 没有被选中（依赖不满足），本次只发布基础固件"
             exit 0
           fi
-          if ! grep -q '^CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray=y' .config; then
+          if ! grep -q '^CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SingBox=y' .config; then
             echo "PASSWALL_STATUS=skipped" >> "$GITHUB_ENV"
-            echo "::warning::Passwall 的 Xray 核心没有选中，本次只发布基础固件"
+            echo "::warning::Passwall 的 Sing-Box 核心没有选中，本次只发布基础固件"
             exit 0
           fi
 
@@ -585,7 +553,7 @@ jobs:
             echo "| 任务状态 | ${{ job.status }} |"
             echo "| ImmortalWrt | \`${TAG}\` |"
             echo "| 默认主题 | luci-theme-argon |"
-            echo "| DAED | luci-app-daede + daed（内核 BTF） |"
+            echo "| DAED | luci-app-daed + daed（内核 BTF） |"
             echo "| Passwall | ${PASSWALL_STATUS:-未启用} |"
             echo "| 发布固件 | ${ARTIFACT_NAME:-未生成} |"
             echo "| 固件大小 | ${ARTIFACT_SIZE_KB:-未知} KB（上限 114688 KB） |"

@@ -44,6 +44,8 @@ env:
   OPENWRT_DIR: openwrt
   IMAGE_LIMIT_KB: "114688"
   HONK_VERSION: "0.1.0-beta.4"
+  # apk 版本号不接受 -beta.4 这种写法，用 Alpine 风格的 _beta4
+  HONK_PKG_VERSION: "0.1.0_beta4"
   HONK_SHA256: "121c94f3a30091c5550ae503ddf7bce118def08ddc301a7f8ffa740f956476d0"
 
 jobs:
@@ -171,11 +173,13 @@ jobs:
           include $(TOPDIR)/rules.mk
 
           PKG_NAME:=honk
-          PKG_VERSION:=0.1.0-beta.4
+          PKG_VERSION:=0.1.0_beta4
           PKG_RELEASE:=1
 
-          PKG_SOURCE:=honk-core-v$(PKG_VERSION)-aarch64-unknown-linux-musl-full.tar.gz
-          PKG_SOURCE_URL:=https://github.com/daeuniverse/honk/releases/download/v$(PKG_VERSION)
+          # 上游 tag/文件名仍是 0.1.0-beta.4，与 apk 包版本分开
+          HONK_UPSTREAM_VERSION:=0.1.0-beta.4
+          PKG_SOURCE:=honk-core-v$(HONK_UPSTREAM_VERSION)-aarch64-unknown-linux-musl-full.tar.gz
+          PKG_SOURCE_URL:=https://github.com/daeuniverse/honk/releases/download/v$(HONK_UPSTREAM_VERSION)
           PKG_HASH:=121c94f3a30091c5550ae503ddf7bce118def08ddc301a7f8ffa740f956476d0
 
           PKG_LICENSE:=GPL-3.0-only
@@ -232,7 +236,8 @@ jobs:
           EOF
 
           # 版本/哈希以 workflow env 为准，避免两处不一致
-          sed -i "s|^PKG_VERSION:=.*|PKG_VERSION:=${HONK_VERSION}|" package/honk/Makefile
+          sed -i "s|^PKG_VERSION:=.*|PKG_VERSION:=${HONK_PKG_VERSION}|" package/honk/Makefile
+          sed -i "s|^HONK_UPSTREAM_VERSION:=.*|HONK_UPSTREAM_VERSION:=${HONK_VERSION}|" package/honk/Makefile
           sed -i "s|^PKG_HASH:=.*|PKG_HASH:=${HONK_SHA256}|" package/honk/Makefile
 
           cat > package/honk/files/config.dae <<'EOF'
@@ -301,7 +306,8 @@ jobs:
             "https://github.com/daeuniverse/honk/releases/download/v${HONK_VERSION}/$HONK_FILE"
           echo "${HONK_SHA256}  dl/$HONK_FILE" | sha256sum -c -
 
-          grep -q "PKG_VERSION:=${HONK_VERSION}" package/honk/Makefile
+          grep -q "PKG_VERSION:=${HONK_PKG_VERSION}" package/honk/Makefile
+          grep -q "HONK_UPSTREAM_VERSION:=${HONK_VERSION}" package/honk/Makefile
           test -f package/honk/files/config.dae
           test -f package/honk/files/honk.init
           test -f "dl/$HONK_FILE"

@@ -1,0 +1,697 @@
+# =============================================================================
+#  H3C NX30 Pro —— ImmortalWrt 112M 自定义编译（honk + Passwall/sing-box 版）
+#
+#  与 build.yml 的区别：
+#    * 不集成 luci-app-daede / daed / dae
+#    * 集成 daeuniverse/honk：使用官方 aarch64 musl full 预编译包
+#      （静态二进制，内嵌 doona UI，自带 eBPF 程序）
+#    * Passwall 只编译 sing-box 内核，不再编译 xray-core
+#    * 仍然替换 Passwall 的 status.htm，默认主题仍是 Argon
+#
+#  注意：honk 与 Passwall 都是透明代理，默认不要同时启动；
+#        honk 的 init 脚本会安装但不会自动 enable，配置好后再 service honk start。
+# =============================================================================
+name: build-immortalwrt-112m-honk
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "ImmortalWrt 源码 tag（例如 v25.12.2）"
+        required: true
+        default: "v25.12.2"
+      with_passwall:
+        description: "是否集成 luci-app-passwall（sing-box 内核）"
+        type: boolean
+        default: true
+      passwall_status_htm:
+        description: "自定义 Passwall status.htm 的 raw 链接（留空则读取仓库根目录 luci-app-passwall/status.htm）"
+        required: false
+        default: ""
+      extra_packages:
+        description: "额外软件包（空格分隔，可留空）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-immortalwrt-112m-honk-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  OPENWRT_DIR: openwrt
+  IMAGE_LIMIT_KB: "114688"
+  HONK_VERSION: "0.1.0-beta.4"
+  HONK_SHA256: "121c94f3a30091c5550ae503ddf7bce118def08ddc301a7f8ffa740f956476d0"
+
+jobs:
+  build:
+    name: 编译 NX30PRO 112M 固件（honk + sing-box）
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          set -euo pipefail
+          sudo rm -rf --one-file-system \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /opt/az \
+            /usr/share/swift \
+            /usr/local/lib/node_modules \
+            /usr/lib/jvm \
+            /usr/share/java \
+            /usr/local/share/chromium \
+            /opt/microsoft
+          sudo apt-get clean
+          docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: 安装编译依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential clang llvm flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev rsync unzip zlib1g-dev file wget \
+            quilt python3-setuptools python3-pyelftools swig time cpio bc \
+            libelf-dev libdw-dev dwarves libcap-dev pkg-config autoconf automake \
+            libtool-bin cmake
+          df -h /
+
+      - name: 拉取 ImmortalWrt 源码
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$TAG" \
+            https://github.com/immortalwrt/immortalwrt.git "$OPENWRT_DIR"
+          git -C "$OPENWRT_DIR" log -1 --format='commit %H%nsubject %s%ndate %ad'
+
+      - name: 改为 112M 大分区
+        run: |
+          set -euo pipefail
+          python3 scripts/enable_112m.py "$OPENWRT_DIR"
+          git -C "$OPENWRT_DIR" diff --stat
+          git -C "$OPENWRT_DIR" diff > 112m-changes.diff
+
+      - name: 更新并安装 feeds
+        run: |
+          set -euo pipefail
+          cd "$OPENWRT_DIR"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 加入 Passwall 源码并准备 honk 包
+        env:
+          STATUS_URL: ${{ inputs.passwall_status_htm }}
+        run: |
+          set -euo pipefail
+          cd "$OPENWRT_DIR"
+
+          # Passwall 上游 README 要求：先删掉 openwrt 源里同名的核心包
+          for p in xray-core v2ray-geodata sing-box chinadns-ng dns2socks hysteria \
+                   ipt2socks microsocks naiveproxy shadowsocks-rust shadowsocksr-libev \
+                   simple-obfs tcping v2ray-plugin xray-plugin geoview shadow-tls smartdns; do
+            rm -rf "feeds/packages/net/$p" "package/feeds/packages/$p"
+          done
+          rm -rf feeds/luci/applications/luci-app-passwall package/feeds/luci/luci-app-passwall
+
+          git clone --depth 1 https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git \
+            package/passwall-packages
+          git clone --depth 1 https://github.com/Openwrt-Passwall/openwrt-passwall.git \
+            package/passwall-luci
+
+          # 25.12 官方源没有 lyaml，去掉这条依赖以免 Kconfig 告警
+          sed -i 's/ +lyaml//' package/passwall-luci/luci-app-passwall/Makefile || true
+          if grep -q 'lyaml' package/passwall-luci/luci-app-passwall/Makefile; then
+            echo "::warning::luci-app-passwall 仍依赖 lyaml（官方源已移除该包），构建时将忽略"
+          fi
+
+          # 可选：替换 Passwall 状态页 status.htm
+          # 来源优先级：workflow 输入 passwall_status_htm > 仓库根目录 luci-app-passwall/status.htm
+          STATUS_SRC=""
+          if [ -n "${STATUS_URL:-}" ]; then
+            STATUS_URL=$(printf '%s' "$STATUS_URL" | sed -E \
+              's#^https://github\.com/([^/]+)/([^/]+)/blob/(.+)$#https://raw.githubusercontent.com/\1/\2/\3#')
+            curl -fsSL "$STATUS_URL" -o /tmp/passwall-status.htm
+            STATUS_SRC=/tmp/passwall-status.htm
+          elif [ -f ../luci-app-passwall/status.htm ]; then
+            STATUS_SRC=../luci-app-passwall/status.htm
+          fi
+
+          if [ -n "$STATUS_SRC" ]; then
+            grep -qi '<' "$STATUS_SRC" || {
+              echo "ERROR: $STATUS_SRC 不像 HTML 文件"; exit 1; }
+            DST=package/passwall-luci/luci-app-passwall/luasrc/view/passwall/global/status.htm
+            cp -f "$STATUS_SRC" "$DST"
+            mkdir -p files/usr/lib64/lua/luci/view/passwall/global
+            cp -f "$STATUS_SRC" files/usr/lib64/lua/luci/view/passwall/global/status.htm
+            echo "已替换 Passwall 状态页："
+            head -n 5 "$DST"
+          else
+            echo "::warning::没有提供 status.htm，保持默认状态页"
+          fi
+
+          # ------------------------------------------------------------------
+          # honk：官方 aarch64 musl full 预编译包（含内嵌 doona UI）
+          # ------------------------------------------------------------------
+          mkdir -p package/honk/files
+
+          cat > package/honk/Makefile <<'EOF'
+          include $(TOPDIR)/rules.mk
+
+          PKG_NAME:=honk
+          PKG_VERSION:=0.1.0-beta.4
+          PKG_RELEASE:=1
+
+          PKG_SOURCE:=honk-core-v$(PKG_VERSION)-aarch64-unknown-linux-musl-full.tar.gz
+          PKG_SOURCE_URL:=https://github.com/daeuniverse/honk/releases/download/v$(PKG_VERSION)
+          PKG_HASH:=121c94f3a30091c5550ae503ddf7bce118def08ddc301a7f8ffa740f956476d0
+
+          PKG_LICENSE:=GPL-3.0-only
+          PKG_LICENSE_FILES:=LICENSE
+          PKG_MAINTAINER:=daeuniverse
+
+          include $(INCLUDE_DIR)/package.mk
+
+          # 预编译的 Rust 静态二进制不再二次 strip，避免 sstrip 破坏 ELF
+          RSTRIP:=:
+
+          define Package/honk
+            SECTION:=net
+            CATEGORY:=Network
+            SUBMENU:=Web Servers/Proxies
+            TITLE:=honk eBPF transparent proxy
+            URL:=https://github.com/daeuniverse/honk
+            DEPENDS:=+kmod-sched-core +kmod-nft-queue +kmod-nfnetlink-queue
+          endef
+
+          define Package/honk/description
+            honk is an experimental eBPF transparent proxy engine written in Rust.
+            Installs the official static musl full build with embedded doona UI.
+          endef
+
+          define Package/honk/conffiles
+          /etc/honk/config.dae
+          endef
+
+          define Build/Prepare
+          	mkdir -p $(PKG_BUILD_DIR)
+          	$(TAR) -xzf $(DL_DIR)/$(PKG_SOURCE) -C $(PKG_BUILD_DIR) --strip-components=1
+          endef
+
+          define Build/Compile
+          endef
+
+          define Package/honk/install
+          	$(INSTALL_DIR) $(1)/usr/bin
+          	$(INSTALL_BIN) $(PKG_BUILD_DIR)/honk-core $(1)/usr/bin/honk-core
+          	$(LN) honk-core $(1)/usr/bin/honk
+
+          	$(INSTALL_DIR) $(1)/etc/honk
+          	$(INSTALL_CONF) ./files/config.dae $(1)/etc/honk/config.dae
+
+          	$(INSTALL_DIR) $(1)/etc/init.d
+          	$(INSTALL_BIN) ./files/honk.init $(1)/etc/init.d/honk
+
+          	$(INSTALL_DIR) $(1)/etc/uci-defaults
+          	$(INSTALL_BIN) ./files/99-honk-disable $(1)/etc/uci-defaults/99-honk-disable
+          endef
+
+          $(eval $(call BuildPackage,honk))
+          EOF
+
+          # 版本/哈希以 workflow env 为准，避免两处不一致
+          sed -i "s|^PKG_VERSION:=.*|PKG_VERSION:=${HONK_VERSION}|" package/honk/Makefile
+          sed -i "s|^PKG_HASH:=.*|PKG_HASH:=${HONK_SHA256}|" package/honk/Makefile
+
+          cat > package/honk/files/config.dae <<'EOF'
+          global {
+              wan_interface: auto
+              lan_interface: br-lan
+              log_level: info
+              auto_config_kernel_parameter: true
+          }
+
+          routing {
+              fallback: direct
+          }
+
+          experimental {
+              native_api {
+                  enabled: true
+                  listen: '0.0.0.0:9527'
+                  secret: 'honk-change-me-please'
+                  ui: 'embedded'
+              }
+          }
+          EOF
+
+          cat > package/honk/files/honk.init <<'EOF'
+          #!/bin/sh /etc/rc.common
+          USE_PROCD=1
+          START=95
+          STOP=10
+
+          start_service() {
+          	mkdir -p /sys/fs/bpf
+          	grep -qs ' /sys/fs/bpf bpf ' /proc/mounts || mount -t bpf bpf /sys/fs/bpf 2>/dev/null
+
+          	procd_open_instance
+          	procd_set_param command /usr/bin/honk-core --disable-timestamp -c /etc/honk/config.dae
+          	procd_set_param respawn 3600 5 5
+          	procd_set_param limits memlock=unlimited nofile=1048576
+          	procd_set_param file /etc/honk/config.dae
+          	procd_close_instance
+          }
+
+          reload_service() {
+          	/usr/bin/honk-core reload 2>/dev/null
+          }
+
+          service_triggers() {
+          	procd_add_reload_trigger honk
+          }
+          EOF
+
+          chmod +x package/honk/files/honk.init
+
+          # honk 与 Passwall 都是透明代理，默认不随系统启动，避免互相抢流量
+          cat > package/honk/files/99-honk-disable <<'EOF'
+          #!/bin/sh
+          /etc/init.d/honk disable
+          exit 0
+          EOF
+          chmod +x package/honk/files/99-honk-disable
+
+          HONK_FILE="honk-core-v${HONK_VERSION}-aarch64-unknown-linux-musl-full.tar.gz"
+          mkdir -p dl
+          curl -L --fail --silent --show-error --retry 3 --retry-delay 2 \
+            -o "dl/$HONK_FILE" \
+            "https://github.com/daeuniverse/honk/releases/download/v${HONK_VERSION}/$HONK_FILE"
+          echo "${HONK_SHA256}  dl/$HONK_FILE" | sha256sum -c -
+
+          grep -q "PKG_VERSION:=${HONK_VERSION}" package/honk/Makefile
+          test -f package/honk/files/config.dae
+          test -f package/honk/files/honk.init
+          test -f "dl/$HONK_FILE"
+
+      - name: 设置默认主题为 Argon
+        run: |
+          set -euo pipefail
+          cd "$OPENWRT_DIR"
+
+          mapfile -t collections < <(grep -rl 'luci-theme-bootstrap' feeds/luci/collections || true)
+          if [ "${#collections[@]}" -gt 0 ]; then
+            sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' "${collections[@]}"
+            grep -R 'luci-theme-argon' feeds/luci/collections || true
+          else
+            echo "::warning::feeds/luci/collections 中没有 luci-theme-bootstrap，跳过集合依赖替换"
+          fi
+
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99-default-argon <<'EOF'
+          #!/bin/sh
+          uci -q get luci.themes.Argon >/dev/null 2>&1 || uci set luci.themes.Argon='/luci-static/argon'
+          uci set luci.main.mediaurlbase='/luci-static/argon'
+          uci commit luci
+          exit 0
+          EOF
+          chmod +x files/etc/uci-defaults/99-default-argon
+
+      - name: 生成基础配置（Argon + honk）
+        env:
+          EXTRA_PACKAGES: ${{ inputs.extra_packages }}
+        run: |
+          set -euo pipefail
+          cd "$OPENWRT_DIR"
+
+          cat > .config <<'EOF'
+          CONFIG_TARGET_mediatek=y
+          CONFIG_TARGET_mediatek_filogic=y
+          CONFIG_TARGET_MULTI_PROFILE=n
+          CONFIG_TARGET_mediatek_filogic_DEVICE_h3c_magic-nx30-pro=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-theme-argon=y
+          CONFIG_PACKAGE_honk=y
+          # honk 的 eBPF 运行时需要内核 BTF（/sys/kernel/btf/vmlinux）
+          CONFIG_KERNEL_DEBUG_INFO=y
+          CONFIG_KERNEL_DEBUG_INFO_REDUCED=n
+          CONFIG_KERNEL_DEBUG_INFO_BTF=y
+          CONFIG_KERNEL_CGROUP_BPF=y
+          EOF
+
+          for p in $EXTRA_PACKAGES; do
+            echo "CONFIG_PACKAGE_${p}=y" >> .config
+          done
+
+          make defconfig
+
+          echo "=== 目标设备 ==="
+          grep -E '^CONFIG_TARGET_(mediatek|.*DEVICE)' .config || true
+          echo "=== 关键软件包 ==="
+          grep -E '^CONFIG_PACKAGE_(luci|luci-theme-argon|honk)=' .config || true
+
+          grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_h3c_magic-nx30-pro=y' .config || {
+            echo "ERROR: 没有选中 h3c_magic-nx30-pro"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_luci-theme-argon=y' .config || {
+            echo "ERROR: luci-theme-argon 没有被选中"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_honk=y' .config || {
+            echo "ERROR: honk 没有被选中"; exit 1; }
+
+          grep -E '^CONFIG_KERNEL_(DEBUG_INFO|DEBUG_INFO_BTF|CGROUP_BPF)' .config || true
+          if ! grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config; then
+            echo "::warning::内核 BTF 没有开启，honk 启动时可能找不到 /sys/kernel/btf/vmlinux"
+          fi
+
+      - name: 预下载源码包
+        continue-on-error: true
+        run: |
+          cd "$OPENWRT_DIR"
+          make -j"$(nproc)" download
+
+      - name: 编译基础固件（Argon + honk）
+        run: |
+          set -uo pipefail
+          cd "$OPENWRT_DIR"
+          df -h /
+
+          ok=0
+          for attempt in 1 2 3; do
+            set +e
+            make -j"$(nproc)" 2>&1 | tee -a ../build-base.log
+            rc=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$rc" -eq 0 ]; then
+              ok=1
+              break
+            fi
+
+            pkg=$(sed -n 's/^[[:space:]]*ERROR: \(package\/[^ ]*\) failed to build.*/\1/p' \
+                    ../build-base.log | head -n1)
+            echo "第 $attempt 次整体编译失败，失败包：${pkg:-未知}"
+            if [ -z "$pkg" ]; then
+              break
+            fi
+
+            set +e
+            make "$pkg/compile" V=s -j1 2>&1 | tee -a ../failed-pkg-rebuild.log
+            rc2=${PIPESTATUS[0]}
+            set -e
+            if [ "$rc2" -ne 0 ]; then
+              echo "ERROR: $pkg 单独编译仍然失败"
+              break
+            fi
+          done
+
+          if [ "$ok" -ne 1 ]; then
+            echo "ERROR: 基础固件编译失败"
+            exit 1
+          fi
+          echo "=== 基础固件编译完成 ==="
+
+      - name: 失败诊断（提取真实错误）
+        if: failure()
+        run: |
+          set -uo pipefail
+
+          : > build-error.txt
+          {
+            echo "===== 环境 ====="
+            df -h / || true
+            free -h || true
+            sudo dmesg 2>/dev/null | grep -i -E "out of memory|killed process|oom" | tail -n 20 || true
+          } >> build-error.txt
+
+          for log in build-base.log failed-pkg-rebuild.log build-passwall.log; do
+            [ -f "$log" ] || continue
+            {
+              echo "===== $log ====="
+              echo "--- 关键字（最后 80 条）---"
+              grep -n -i -E "go: |error:|fatal|failed|Error [0-9]|no space|killed" "$log" | tail -n 80 || true
+              echo "--- 末尾 160 行 ---"
+              tail -n 160 "$log"
+              echo
+            } >> build-error.txt
+          done
+
+          if [ -d openwrt/logs ]; then
+            {
+              echo "===== openwrt/logs（honk/singbox/golang 相关）====="
+              find openwrt/logs -type f 2>/dev/null | grep -i -E "honk|sing|golang" | while read -r f; do
+                echo "--- $f ---"
+                tail -n 200 "$f"
+              done
+            } >> build-error.txt
+          fi
+
+          cat build-error.txt
+          {
+            echo ""
+            echo "### 构建失败详情"
+            echo '```'
+            tail -n 300 build-error.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: 收集基础固件
+        run: |
+          set -euo pipefail
+          cd "$OPENWRT_DIR"
+
+          mkdir -p ../out/base
+          shopt -s nullglob
+          files=(bin/targets/mediatek/filogic/*.itb \
+                 bin/targets/mediatek/filogic/*.bin \
+                 bin/targets/mediatek/filogic/*.fip)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "ERROR: bin/targets 下没有找到固件产物"
+            exit 1
+          fi
+          cp -v "${files[@]}" ../out/base/
+          cp -v ../112m-changes.diff ../out/base/ 2>/dev/null || true
+          cp -v bin/targets/mediatek/filogic/sha256sums ../out/base/ 2>/dev/null || true
+          cp -v bin/targets/mediatek/filogic/profiles.json ../out/base/ 2>/dev/null || true
+
+          img=$(ls ../out/base/*-squashfs-sysupgrade.itb 2>/dev/null | head -n1 || true)
+          if [ -z "$img" ]; then
+            echo "ERROR: 没有生成 *-squashfs-sysupgrade.itb"
+            exit 1
+          fi
+          size_kb=$(( $(stat -c%s "$img") / 1024 ))
+          echo "BASE_IMAGE=$img" >> "$GITHUB_ENV"
+          echo "BASE_SIZE_KB=$size_kb" >> "$GITHUB_ENV"
+          echo "基础固件：$img（${size_kb} KB / 上限 ${IMAGE_LIMIT_KB} KB）"
+
+          if [ "$size_kb" -ge "$IMAGE_LIMIT_KB" ]; then
+            echo "ERROR: 基础固件已经超过 112M 分区上限"
+            exit 1
+          fi
+
+      - name: 追加 Passwall 配置（sing-box 内核）
+        if: ${{ inputs.with_passwall }}
+        run: |
+          set -euo pipefail
+          cd "$OPENWRT_DIR"
+
+          cat >> .config <<'EOF'
+          # Passwall 只保留 sing-box 内核
+          CONFIG_PACKAGE_dnsmasq=n
+          CONFIG_PACKAGE_dnsmasq-full=y
+          CONFIG_PACKAGE_ip-tiny=n
+          CONFIG_PACKAGE_ip-full=y
+          CONFIG_PACKAGE_luci-app-passwall=y
+          CONFIG_PACKAGE_luci-i18n-passwall-zh-cn=y
+          CONFIG_PACKAGE_sing-box=y
+          CONFIG_PACKAGE_luci-app-passwall_Iptables_Transparent_Proxy=n
+          CONFIG_PACKAGE_luci-app-passwall_Nftables_Transparent_Proxy=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SingBox=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Geodata=y
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray_Plugin=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_GeoView=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SmartDNS=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Haproxy=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Hysteria=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_NaiveProxy=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Shadow_TLS=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Shadowsocks_Rust_Client=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Shadowsocks_Rust_Server=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_ShadowsocksR_Libev_Client=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_ShadowsocksR_Libev_Server=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Simple_Obfs=n
+          CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Plugin=n
+          EOF
+
+          make defconfig
+
+          for _ in 1 2 3; do
+            changed=0
+            if grep -q '^CONFIG_PACKAGE_dnsmasq=y' .config; then
+              sed -i 's/^CONFIG_PACKAGE_dnsmasq=y/# CONFIG_PACKAGE_dnsmasq is not set/' .config
+              changed=1
+            fi
+            if grep -q '^CONFIG_PACKAGE_ip-tiny=y' .config; then
+              sed -i 's/^CONFIG_PACKAGE_ip-tiny=y/# CONFIG_PACKAGE_ip-tiny is not set/' .config
+              changed=1
+            fi
+            if [ "$changed" -eq 0 ]; then
+              break
+            fi
+            make defconfig
+          done
+
+          echo "=== Passwall / sing-box 配置 ==="
+          grep -E '^CONFIG_PACKAGE_(luci-app-passwall|sing-box|dnsmasq|ip-full|ip-tiny)' .config || true
+
+          if ! grep -q '^CONFIG_PACKAGE_luci-app-passwall=y' .config; then
+            echo "PASSWALL_STATUS=skipped" >> "$GITHUB_ENV"
+            echo "::warning::luci-app-passwall 没有被选中，本次只发布 honk 基础固件"
+            exit 0
+          fi
+          if ! grep -q '^CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SingBox=y' .config; then
+            echo "PASSWALL_STATUS=skipped" >> "$GITHUB_ENV"
+            echo "::warning::Passwall 的 sing-box 内核没有选中，本次只发布基础固件"
+            exit 0
+          fi
+          if ! grep -q '^CONFIG_PACKAGE_sing-box=y' .config; then
+            echo "PASSWALL_STATUS=skipped" >> "$GITHUB_ENV"
+            echo "::warning::sing-box 没有被选中，本次只发布基础固件"
+            exit 0
+          fi
+
+          echo "PASSWALL_STATUS=pending" >> "$GITHUB_ENV"
+
+      - name: 编译含 Passwall(sing-box) 的固件
+        if: ${{ inputs.with_passwall && env.PASSWALL_STATUS == 'pending' }}
+        run: |
+          set -euo pipefail
+          cd "$OPENWRT_DIR"
+
+          set +e
+          make -j"$(nproc)" 2>&1 | tee ../build-passwall.log
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$rc" -ne 0 ]; then
+            echo "PASSWALL_STATUS=failed" >> "$GITHUB_ENV"
+            echo "::warning::加入 Passwall(sing-box) 后编译失败，本次只发布 honk 基础固件，详见 build-passwall.log"
+            exit 0
+          fi
+
+          shopt -s nullglob
+          files=(bin/targets/mediatek/filogic/*.itb)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "PASSWALL_STATUS=failed" >> "$GITHUB_ENV"
+            echo "::warning::没有生成含 Passwall 的固件，本次只发布基础固件"
+            exit 0
+          fi
+
+          mkdir -p ../out/passwall
+          cp -v bin/targets/mediatek/filogic/*.itb \
+                bin/targets/mediatek/filogic/*.bin \
+                bin/targets/mediatek/filogic/*.fip ../out/passwall/ 2>/dev/null || true
+          cp -v ../112m-changes.diff ../out/passwall/ 2>/dev/null || true
+          cp -v bin/targets/mediatek/filogic/sha256sums ../out/passwall/ 2>/dev/null || true
+          cp -v bin/targets/mediatek/filogic/profiles.json ../out/passwall/ 2>/dev/null || true
+
+          img=$(ls ../out/passwall/*-squashfs-sysupgrade.itb 2>/dev/null | head -n1 || true)
+          if [ -z "$img" ]; then
+            echo "PASSWALL_STATUS=failed" >> "$GITHUB_ENV"
+            echo "::warning::没有生成 *-squashfs-sysupgrade.itb，本次只发布基础固件"
+            exit 0
+          fi
+          size_kb=$(( $(stat -c%s "$img") / 1024 ))
+          echo "PASSWALL_IMAGE=$img" >> "$GITHUB_ENV"
+          echo "PASSWALL_SIZE_KB=$size_kb" >> "$GITHUB_ENV"
+          echo "PASSWALL_STATUS=ok" >> "$GITHUB_ENV"
+          echo "含 Passwall 固件：$img（${size_kb} KB / 上限 ${IMAGE_LIMIT_KB} KB）"
+
+          if [ "$size_kb" -ge "$IMAGE_LIMIT_KB" ]; then
+            echo "PASSWALL_STATUS=failed" >> "$GITHUB_ENV"
+            echo "::warning::带 Passwall 的固件超过上限，本次只发布基础固件"
+          fi
+
+      - name: 选择要发布的固件
+        if: success()
+        run: |
+          set -euo pipefail
+          if [ "${PASSWALL_STATUS:-}" = "ok" ] && ls out/passwall/*-squashfs-sysupgrade.itb >/dev/null 2>&1; then
+            flavor="singbox"
+            size_kb="$PASSWALL_SIZE_KB"
+            dir="out/passwall"
+          else
+            flavor="base"
+            size_kb="$BASE_SIZE_KB"
+            dir="out/base"
+          fi
+          echo "ARTIFACT_DIR=$dir" >> "$GITHUB_ENV"
+          echo "ARTIFACT_FLAVOR=$flavor" >> "$GITHUB_ENV"
+          echo "ARTIFACT_SIZE_KB=$size_kb" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=immortalwrt-112m-${{ inputs.tag }}-honk-${flavor}" >> "$GITHUB_ENV"
+
+      - name: 写入构建摘要
+        if: always()
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -uo pipefail
+          {
+            echo "## NX30PRO 112M 固件构建结果（honk + sing-box）"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 任务状态 | ${{ job.status }} |"
+            echo "| ImmortalWrt | \`${TAG}\` |"
+            echo "| 默认主题 | luci-theme-argon |"
+            echo "| honk | v${HONK_VERSION}（musl full，内嵌 doona） |"
+            echo "| Passwall | ${PASSWALL_STATUS:-未启用}（sing-box 内核） |"
+            echo "| 发布固件 | ${ARTIFACT_NAME:-未生成} |"
+            echo "| 固件大小 | ${ARTIFACT_SIZE_KB:-未知} KB（上限 114688 KB） |"
+            echo ""
+            echo "### 产物列表"
+            echo '```'
+            ls -lh "${ARTIFACT_DIR:-out}" 2>/dev/null || echo "（无）"
+            echo '```'
+            echo ""
+            if [ "${PASSWALL_STATUS:-}" = "failed" ]; then
+              echo "> Passwall 阶段编译失败，已自动退回只含 honk 的基础固件。构建日志见 \`build-logs-*\` artifact。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传固件
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_DIR }}/*
+          if-no-files-found: error
+          retention-days: 60
+
+      - name: 上传构建日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_id }}
+          path: |
+            build-base.log
+            build-passwall.log
+            failed-pkg-rebuild.log
+            build-error.txt
+            openwrt/logs
+            openwrt/.config
+            112m-changes.diff
+          if-no-files-found: ignore
+          retention-days: 14

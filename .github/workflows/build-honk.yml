@@ -8,8 +8,8 @@
 #    * Passwall 只编译 sing-box 内核，不再编译 xray-core
 #    * 仍然替换 Passwall 的 status.htm，默认主题仍是 Argon
 #
-#  注意：honk 与 Passwall 都是透明代理，默认不要同时启动；
-#        honk 的 init 脚本会安装但不会自动 enable，配置好后再 service honk start。
+#  注意：Honk 与 Passwall 都是透明代理，默认不要同时启动；
+#        Honk 的 init 脚本会安装但不会自动 enable，配置好后再 service honk start。
 # =============================================================================
 name: build-immortalwrt-112m-honk
 
@@ -34,7 +34,7 @@ on:
         default: ""
 
 permissions:
-  contents: read
+  contents: write # 【修正1】必须开启写入权限，否则无法创建 Release
 
 concurrency:
   group: build-immortalwrt-112m-honk-${{ github.ref }}
@@ -677,7 +677,7 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: 上传固件
+      - name: 上传固件 (Artifact)
         if: success()
         uses: actions/upload-artifact@v4
         with:
@@ -686,7 +686,7 @@ jobs:
           if-no-files-found: error
           retention-days: 60
 
-      - name: 上传构建日志
+      - name: 上传构建日志 (Artifact)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -701,3 +701,24 @@ jobs:
             112m-changes.diff
           if-no-files-found: ignore
           retention-days: 14
+
+      # 【修正2】在此处追加发布 GitHub Release 的步骤
+      - name: 创建并发布 GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ inputs.tag }}-build-${{ github.run_id }}
+          name: H3C NX30 Pro 112M - ${{ inputs.tag }} (${{ env.ARTIFACT_FLAVOR }})
+          body: |
+            ### ImmortalWrt 自定义编译固件 (112M 大分区)
+            
+            **包含核心组件：**
+            * 默认主题：**Argon**
+            * 透明代理：**honk** (v${{ env.HONK_VERSION }} 静态二进制，内嵌 doona UI)
+            * 备选代理：**Passwall** (${{ env.PASSWALL_STATUS == 'ok' && '集成 sing-box 内核' || '未集成' }})
+            * 编译架构：aarch64 / MediaTek Filogic
+            
+            > **注意：** honk 与 Passwall 均为透明代理，默认请勿同时启用以防止网络冲突。
+          files: ${{ env.ARTIFACT_DIR }}/*

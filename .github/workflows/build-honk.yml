@@ -136,10 +136,10 @@ jobs:
           fi
 
           # 2. 精准提取 kenzok8/small 中的 honk 及 luci-app-honk
-          git clone --depth 1 https://github.com/kenzok8/small.git /tmp/kenzok8-small
-          cp -r /tmp/kenzok8-small/honk package/honk
-          cp -r /tmp/kenzok8-small/luci-app-honk package/luci-app-honk
-          rm -rf /tmp/kenzok8-small
+          # git clone --depth 1 https://github.com/kenzok8/small.git /tmp/kenzok8-small
+          # cp -r /tmp/kenzok8-small/honk package/honk
+          # cp -r /tmp/kenzok8-small/luci-app-honk package/luci-app-honk
+          # rm -rf /tmp/kenzok8-small
 
       - name: 设置默认主题为 Argon
         run: |
@@ -178,8 +178,8 @@ jobs:
           CONFIG_TARGET_mediatek_filogic_DEVICE_h3c_magic-nx30-pro=y
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-theme-argon=y
-          CONFIG_PACKAGE_honk=y
-          CONFIG_PACKAGE_luci-app-honk=y
+          # CONFIG_PACKAGE_honk=y
+          # CONFIG_PACKAGE_luci-app-honk=y
           
           # eBPF 内核依赖
           CONFIG_KERNEL_DEBUG_INFO=y

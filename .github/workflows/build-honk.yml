@@ -281,3 +281,19 @@ jobs:
           fi
 
           cat
+      - name: 创建并发布 GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ inputs.tag }}-build-${{ github.run_id }}
+          name: H3C NX30 Pro 112M - ${{ inputs.tag }} (${{ env.ARTIFACT_FLAVOR }})
+          body: |
+            ### ImmortalWrt 自定义编译固件 (112M 大分区)
+
+            **包含核心组件：**
+            * 默认主题：**Argon**
+            * 代理组件：**Passwall** (${{ env.PASSWALL_STATUS == 'ok' && '集成 sing-box 内核' || '未集成' }})
+            * 编译架构：aarch64 / MediaTek Filogic
+          files: ${{ env.ARTIFACT_DIR }}/*

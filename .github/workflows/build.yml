@@ -283,7 +283,7 @@ jobs:
           cat
       - name: 创建并发布 GitHub Release
         uses: softprops/action-gh-release@v2
-        if: success()
+        if: success() && env.ARTIFACT_DIR != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -296,4 +296,4 @@ jobs:
             * 默认主题：**Argon**
             * 代理组件：**Passwall** (${{ env.PASSWALL_STATUS == 'ok' && '集成 sing-box 内核' || '未集成' }})
             * 编译架构：aarch64 / MediaTek Filogic
-          files: ${{ env.ARTIFACT_DIR }}/*
+          files: ./${{ env.ARTIFACT_DIR }}/*

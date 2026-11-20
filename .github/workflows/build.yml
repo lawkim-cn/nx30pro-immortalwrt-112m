@@ -1,7 +1,7 @@
 # =============================================================================
 #  H3C NX30 Pro —— ImmortalWrt 112M 自定义编译（Argon + Passwall/sing-box 版）
 # =============================================================================
-name: build-immortalwrt-112m-passwall
+name: immortalwrt-only-passwall(singbox)
 
 on:
   workflow_dispatch:
